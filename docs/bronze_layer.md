@@ -25,11 +25,13 @@ The Bronze layer must:
 
 ### Tables produced in Bronze
 
-| Delta Table | Source | Rows | Columns |
-|---|---|---|---|
-| `energy_project.bronze.samp` | `samp/samp-*.csv` (2020–2026) | 6,808,591 | 22 |
-| `energy_project.bronze.inadimplencia` | `inadimplencia/inadimplencia.csv` | TBD | TBD |
-| `energy_project.bronze.dominio_indicadores` | `inadimplencia/dominio-indicadores.csv` | TBD | TBD |
+| Delta Table | Source | Rows | Columns | Partitioned |
+|---|---|---|---|---|
+| `energy_project.bronze.samp` | `samp/samp-*.csv` (2020–2026) | 6,808,591 | 22 | `_partition_year` |
+| `energy_project.bronze.inadimplencia` | `inadimplencia/inadimplencia.csv` | ~1.1M | 10 | No |
+| `energy_project.bronze.dominio_indicadores` | `inadimplencia/dominio-indicadores.csv` | ~100 | 6 | No |
+
+> `inadimplencia` and `dominio_indicadores` are not partitioned — their sizes (~58 MB and ~40 KB respectively) don't justify the overhead.
 
 ### SAMP Breakdown by Source File
 
@@ -72,6 +74,18 @@ df_samp_raw = (
 ```
 
 The wildcard `*.csv` enables **parallel reading** of all 7 yearly files — leveraging Spark's distributed compute.
+
+### Date Format Inconsistency Between Datasets
+
+ANEEL uses different date formats across datasets — a real-world data quality issue:
+
+| Dataset | Column | Format | Example |
+|---|---|---|---|
+| SAMP | `DatGeracaoConjuntoDados` | `yyyy-MM-dd` | `2026-04-15` |
+| SAMP | `DatCompetencia` | `yyyy-MM-dd` | `2024-01-01` |
+| Inadimplência | `DatGeracaoConjuntoDados` | `dd-MM-yyyy` | `05-05-2026` |
+
+This inconsistency is handled in the Silver layer with format-aware `to_date()` calls.
 
 ---
 
@@ -117,15 +131,6 @@ SAMP_SCHEMA = StructType([
     StructField("SigAgenteDistribuidora",     StringType(), True),
     # ... all 18 columns as StringType
 ])
-
-df_samp_raw = (
-    spark.read
-    .option("header", "true")
-    .option("sep", ";")
-    .option("encoding", "ISO-8859-1")
-    .schema(SAMP_SCHEMA)              # ← Explicit, deterministic
-    .csv(f"{PATH_SAMP}/*.csv")
-)
 ```
 
 ### Benefits
@@ -168,42 +173,23 @@ df_samp_bronze_partitioned = df_samp_bronze.withColumn(
 ```
 energy_project.bronze.samp/
 ├── _partition_year=2020/
-│   └── part-001.parquet
 ├── _partition_year=2021/
-│   └── part-001.parquet
 ├── _partition_year=2022/
-│   └── part-001.parquet
 ├── _partition_year=2023/
-│   └── part-001.parquet
 ├── _partition_year=2024/
-│   └── part-001.parquet
 ├── _partition_year=2025/
-│   └── part-001.parquet
 └── _partition_year=2026/
-    └── part-001.parquet
 ```
 
-### Query Performance Impact
+### Why `inadimplencia` and `dominio_indicadores` Are Not Partitioned
 
-Queries that filter by year benefit from **partition pruning** — Spark reads only the relevant folder(s):
+Partitioning adds overhead (more files, more metadata). For small tables, it hurts more than it helps:
 
-```sql
--- This query reads ONLY the 2024 partition (1 file)
-SELECT *
-FROM energy_project.bronze.samp
-WHERE _partition_year = 2024;
-
--- Without partitioning, this would scan ALL 6.8M rows
-```
-
-Expected speedup for year-filtered queries: **~7x** (with 7 partitions).
-
-### Use of `F.to_date()` over `.cast("date")`
-
-We use `F.to_date(col, "yyyy-MM-dd")` rather than `.cast("date")` because:
-- ✅ **Format-aware** — explicit about the expected pattern
-- ✅ **Robust** — invalid dates become NULL instead of failing
-- ✅ **Better error handling** — easier to debug
+| Table | Size | Decision |
+|---|---|---|
+| `samp` | ~1.5 GB, 6.8M rows | Partitioned by year ✅ |
+| `inadimplencia` | ~58 MB | Not partitioned |
+| `dominio_indicadores` | ~40 KB | Not partitioned |
 
 ---
 
@@ -226,8 +212,6 @@ Industry convention: columns prefixed with `_` are **technical metadata** (not b
 
 ### Modern Unity Catalog Syntax
 
-We use `F.col("_metadata.file_path")` rather than the deprecated `F.input_file_name()`:
-
 ```python
 # ❌ DEPRECATED (raises error in Unity Catalog)
 .withColumn("_source_file", F.input_file_name())
@@ -236,124 +220,93 @@ We use `F.col("_metadata.file_path")` rather than the deprecated `F.input_file_n
 .withColumn("_source_file", F.col("_metadata.file_path"))
 ```
 
-The `_metadata` struct also provides additional useful properties:
-- `_metadata.file_name`
-- `_metadata.file_size`
-- `_metadata.file_modification_time`
-
-We currently use only `file_path`, but these are available for future enrichment if needed.
-
-### Real-World Use Cases Enabled
-
-#### 1. Debugging
-> *"Values for ELETROPAULO in October/2020 look wrong — where did they come from?"*
-
-```sql
-SELECT DISTINCT _source_file
-FROM energy_project.bronze.samp
-WHERE SigAgenteDistribuidora = 'ELETROPAULO'
-  AND DatCompetencia LIKE '2020-10%';
--- Returns: dbfs:/Volumes/.../samp-2020.csv
-```
-
-#### 2. Incremental Processing
-```sql
--- Process only data loaded today
-SELECT *
-FROM energy_project.bronze.samp
-WHERE _ingestion_date = CURRENT_DATE();
-```
-
-#### 3. Drift Detection
-```sql
--- Compare value distributions between ingestion batches
-SELECT _ingestion_date, AVG(CAST(VlrMercado AS DOUBLE)) AS avg_value
-FROM energy_project.bronze.samp
-GROUP BY _ingestion_date
-ORDER BY _ingestion_date;
-```
-
-#### 4. Selective Reprocessing
-```sql
--- Reprocess only files from a specific year
-DELETE FROM energy_project.bronze.samp
-WHERE _source_file LIKE '%samp-2023%';
--- Then re-run ingestion for 2023 only
-```
-
-### Connection to MLOps
-
-This metadata pattern is foundational for **MLOps best practices**:
-
-| MLOps Practice | Enabled By |
-|---|---|
-| Model Reproducibility | Filter training data by `_ingestion_timestamp <= model_creation_date` |
-| Distribution Drift Monitoring | Compare value stats across `_ingestion_date` buckets |
-| Continuous Training | Trigger retraining based on new `_ingestion_date` values |
-| Audit Trail | Trace any prediction back to its source data |
-
 ---
 
-## 📋 Final Schema (Bronze)
+## 📋 Final Schemas (Bronze)
 
-After all transformations, the `energy_project.bronze.samp` table has the following structure:
+### bronze.samp (22 columns)
 
 ```
 root
- |-- DatGeracaoConjuntoDados: string (nullable = true)
- |-- NumCNPJAgenteDistribuidora: string (nullable = true)
- |-- SigAgenteDistribuidora: string (nullable = true)
- |-- NomAgenteDistribuidora: string (nullable = true)
- |-- NomTipoMercado: string (nullable = true)
- |-- DscModalidadeTarifaria: string (nullable = true)
- |-- DscSubGrupoTarifario: string (nullable = true)
- |-- DscClasseConsumoMercado: string (nullable = true)
- |-- DscSubClasseConsumidor: string (nullable = true)
- |-- DscDetalheConsumidor: string (nullable = true)
- |-- IdeAgenteAcessante: string (nullable = true)
- |-- NumCNPJAgenteAcessante: string (nullable = true)
- |-- NomAgenteAcessante: string (nullable = true)
- |-- DscPostoTarifario: string (nullable = true)
- |-- DscOpcaoEnergia: string (nullable = true)
- |-- DscDetalheMercado: string (nullable = true)
- |-- DatCompetencia: string (nullable = true)
- |-- VlrMercado: string (nullable = true)
- |-- _ingestion_timestamp: timestamp (nullable = true)
- |-- _source_file: string (nullable = true)
- |-- _ingestion_date: date (nullable = true)
- |-- _partition_year: integer (nullable = true)
+ |-- DatGeracaoConjuntoDados: string
+ |-- NumCNPJAgenteDistribuidora: string
+ |-- SigAgenteDistribuidora: string
+ |-- NomAgenteDistribuidora: string
+ |-- NomTipoMercado: string
+ |-- DscModalidadeTarifaria: string
+ |-- DscSubGrupoTarifario: string
+ |-- DscClasseConsumoMercado: string
+ |-- DscSubClasseConsumidor: string
+ |-- DscDetalheConsumidor: string
+ |-- IdeAgenteAcessante: string
+ |-- NumCNPJAgenteAcessante: string
+ |-- NomAgenteAcessante: string
+ |-- DscPostoTarifario: string
+ |-- DscOpcaoEnergia: string
+ |-- DscDetalheMercado: string
+ |-- DatCompetencia: string
+ |-- VlrMercado: string
+ |-- _ingestion_timestamp: timestamp
+ |-- _source_file: string
+ |-- _ingestion_date: date
+ |-- _partition_year: integer
 ```
 
-**Total: 22 columns** (18 source + 3 audit metadata + 1 partition).
+### bronze.inadimplencia (10 columns)
+
+```
+root
+ |-- DatGeracaoConjuntoDados: string
+ |-- SigAgente: string
+ |-- NumCNPJ: string
+ |-- SigIndicador: string
+ |-- AnoIndice: string
+ |-- NumPeriodoIndice: string
+ |-- VlrIndiceEnviado: string
+ |-- _ingestion_timestamp: timestamp
+ |-- _source_file: string
+ |-- _ingestion_date: date
+```
+
+### bronze.dominio_indicadores (6 columns)
+
+```
+root
+ |-- DatGeracaoConjuntoDados: string
+ |-- SigIndicador: string
+ |-- DscIndicador: string
+ |-- _ingestion_timestamp: timestamp
+ |-- _source_file: string
+ |-- _ingestion_date: date
+```
 
 ---
 
 ## 🎓 Lessons Learned
 
 ### 1. Trust but verify Spark's automatic features
-
 `inferSchema=true` is convenient but **not deterministic**. For production pipelines, always use explicit schemas.
 
 ### 2. Brazilian data has unique conventions
-
 Always check separator, encoding, and decimal format when working with Brazilian government data. Don't assume defaults.
 
-### 3. Investigate anomalies — don't hide them
+### 3. Date formats are not consistent even within the same source
+ANEEL uses `yyyy-MM-dd` in SAMP but `dd-MM-yyyy` in Inadimplência. Always inspect a sample row before assuming a format.
 
-When the row count changed between executions (14M → 6.8M), we didn't ignore it or apply a workaround. We investigated, found the root cause (non-deterministic inferSchema), and documented the fix. This investigation became one of the most valuable parts of the project.
+### 4. Investigate anomalies — don't hide them
+When the row count changed between executions (14M → 6.8M), we investigated, found the root cause, and documented the fix.
 
-### 4. Audit metadata is cheap and invaluable
+### 5. Audit metadata is cheap and invaluable
+Three additional columns added minimal storage overhead but unlock critical operational capabilities.
 
-Three additional columns added minimal storage overhead but unlock critical operational capabilities. Always include audit metadata in production data lakes.
-
-### 5. The Bronze layer should be boring
-
-The most "interesting" Bronze layer transformations are usually mistakes. Bronze should preserve, not transform. Save the interesting work for Silver and Gold.
+### 6. The Bronze layer should be boring
+The most "interesting" Bronze layer transformations are usually mistakes. Bronze should preserve, not transform.
 
 ---
 
 ## 🔗 Related Documentation
 
 - [Architecture Overview](architecture.md)
+- [Silver Layer Deep Dive](silver_layer.md)
 - [Data Dictionary (PT-BR → EN)](data_dictionary.md)
 - [Bronze Notebook Source](../notebooks/01_bronze_ingestion.py)

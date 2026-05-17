@@ -44,6 +44,13 @@ This approach provides:
 | `DatCompetencia` | `reference_date` | date | Month/year of reference (first day of month) |
 | `VlrMercado` | `market_value` | double | The actual metric value (meaning depends on market_detail) |
 
+### Derived Columns (added in Silver)
+
+| Column | Type | Logic |
+|---|---|---|
+| `reference_year` | integer | `F.year(reference_date)` |
+| `reference_month` | integer | `F.month(reference_date)` |
+
 ### Audit Metadata (added in Bronze)
 
 | Column | Type | Description |
@@ -51,7 +58,7 @@ This approach provides:
 | `_ingestion_timestamp` | timestamp | When the row was ingested |
 | `_source_file` | string | Original CSV file path |
 | `_ingestion_date` | date | Date of ingestion |
-| `_partition_year` | integer | Year extracted from DatCompetencia (partition column) |
+| `_partition_year` | integer | Year extracted from DatCompetencia (Bronze partition column) |
 
 ---
 
@@ -70,13 +77,11 @@ The `VlrMercado` column **changes meaning** based on `DscDetalheMercado`:
 | "ICMS (R$)" | Tax amount in Brazilian Reais |
 | "Bandeiras (R$)" | Tariff flag amount |
 
-**Implication for analytics:** The Silver/Gold layers should **pivot** this column to separate metrics. For example:
+**Implication for analytics:** The Gold layer should **pivot** this column to separate metrics. For example:
 ```
 distributor_code | reference_date | num_consumers | consumption_mwh | revenue_brl
 COPEL-DIS        | 2024-01-01     | 4,500,000     | 1,200,000       | 850,000,000
 ```
-
-This makes the data analytics-ready and avoids the need to filter by `market_detail` for every query.
 
 ### Brazilian Decimal Convention
 
@@ -84,7 +89,7 @@ The `VlrMercado` values use **comma as decimal separator** (Brazilian convention
 - `76,000000` represents `76.0`
 - `266754,610000` represents `266,754.61`
 
-Silver layer transformation must handle this conversion:
+Silver layer transformation handles this:
 ```python
 F.regexp_replace(F.col("VlrMercado"), ",", ".").cast("double")
 ```
@@ -97,22 +102,64 @@ Both `NumCNPJAgenteDistribuidora` and `NumCNPJAgenteAcessante` are **identifiers
 - Should never be cast to numeric types (loses formatting)
 - Used for joins and lookups, not arithmetic
 
-In Silver, these will be normalized:
-```python
-F.lpad(F.regexp_replace(F.col("distributor_cnpj"), "[^0-9]", ""), 14, "0")
-```
-
 ---
 
 ## 📊 Indqual Dataset (Inadimplência)
 
-> 📝 **To be documented** when the Inadimplência dataset is ingested in the next phase.
+**Source:** [Indqual - Inadimplência](https://dadosabertos.aneel.gov.br/)
 
-The Indqual dataset includes:
-- `inadimplencia.csv` — Default indicators by distributor and class
-- `dominio-indicadores.csv` — Dimension table with indicator code descriptions
+**Files:**
+- `inadimplencia.csv` — Default indicators by distributor (~58 MB, 1.1M rows)
+- `dominio-indicadores.csv` — Dimension table with indicator descriptions (~40 KB)
 
-This is a classic **fact + dimension** modeling pattern (star schema).
+**Coverage:** 2012–2026 (monthly)
+
+### inadimplencia.csv — Column Mapping
+
+| PT-BR (Bronze) | EN (Silver+) | Type (Silver) | Description |
+|---|---|---|---|
+| `DatGeracaoConjuntoDados` | `dataset_generation_date` | date | Date when ANEEL generated this dataset (format: `dd-MM-yyyy`) |
+| `SigAgente` | `distributor_code` | string | Distributor's short code |
+| `NumCNPJ` | `distributor_cnpj` | string | Distributor's CNPJ (Brazilian tax ID) |
+| `SigIndicador` | `indicator_code` | string | Indicator code — FK to `dominio_indicadores` |
+| `AnoIndice` | `reference_year` | integer | Reference year |
+| `NumPeriodoIndice` | `reference_month` | integer | Reference month (1–12) |
+| `VlrIndiceEnviado` | `indicator_value` | double | Indicator value (comma as decimal separator in source) |
+
+### Derived Columns (added in Silver)
+
+| Column | Type | Logic |
+|---|---|---|
+| `reference_date` | date | Constructed as first day of month: `concat(AnoIndice, "-", lpad(NumPeriodoIndice, 2, "0"), "-01")` |
+
+> ⚠️ **Note:** `inadimplencia.csv` has no single date column. `reference_date` is built from `AnoIndice` + `NumPeriodoIndice`. The source `DatGeracaoConjuntoDados` uses `dd-MM-yyyy` format (different from SAMP which uses `yyyy-MM-dd`).
+
+### Enriched Column (from join with dominio_indicadores)
+
+| Column | Type | Source | Description |
+|---|---|---|---|
+| `indicator_description` | string | `dominio_indicadores.DscIndicador` | Full Portuguese description of the indicator |
+
+### dominio-indicadores.csv — Column Mapping
+
+This is a **dimension/lookup table** used only to enrich `inadimplencia` via broadcast join in Silver. It does not produce its own Silver table.
+
+| PT-BR (Bronze) | Used in Silver as | Description |
+|---|---|---|
+| `SigIndicador` | `indicator_code` (join key) | Indicator code |
+| `DscIndicador` | `indicator_description` | Full description of the indicator |
+| `DatGeracaoConjuntoDados` | *(dropped)* | Dataset generation date |
+
+### Example Indicators
+
+| `indicator_code` | `indicator_description` |
+|---|---|
+| `ITotCrt` | Indicador total de crédito |
+| `ITot12` | Perc. da rec. fat. 12° mês ant. não receb. no mês de ref. todos os consumidores |
+| `ITot21` | Perc. da rec. fat. 21° mês ant. não receb. no mês de ref. todos os consumidores |
+| `ITot24` | Perc. da rec. fat. 24° mês ant. não receb. no mês de ref. todos os consumidores |
+| `CMM` | Consumo médio mensal, em MWh |
+| `AREA` | Área do conj., expressa em km2 |
 
 ---
 
@@ -120,6 +167,7 @@ This is a classic **fact + dimension** modeling pattern (star schema).
 
 - [Architecture & Design Decisions](architecture.md)
 - [Bronze Layer Deep Dive](bronze_layer.md)
+- [Silver Layer Deep Dive](silver_layer.md)
 - [ANEEL Official Data Dictionary (PDF)](https://dadosabertos.aneel.gov.br/dataset/samp-sistema-de-acompanhamento-de-informacoes-de-mercado-para-regulacao-economica)
 
 ---

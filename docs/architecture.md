@@ -13,24 +13,28 @@ The project follows Databricks' **medallion architecture** pattern, organizing d
 | Layer | Purpose | Data Quality | Schema | Audience |
 |---|---|---|---|---|
 | **🟫 Raw** | Source files preserved as-is | Source-dependent | N/A (files) | Data Engineers |
-| **🥉 Bronze** | Lossless ingestion + metadata | Type-preserved (strings) | Source-faithful | Data Engineers |
-| **🥈 Silver** | Cleansed, typed, validated | Quality-enforced | Standardized (EN) | Data Scientists |
+| **🥉 Bronze** | Lossless ingestion + metadata | Type-preserved (strings) | Source-faithful (PT-BR) | Data Engineers |
+| **🥈 Silver** | Cleansed, typed, validated, joined | Quality-enforced | Standardized (EN) | Data Scientists |
 | **🥇 Gold** | Aggregated, ML-ready | Business-validated | Use-case oriented | Analysts, BI users |
 
 ### Catalog Structure (Unity Catalog)
 
 ```
-energy_project/                    # Catalog
-├── raw/                            # Schema
-│   └── aneel_files/                # Volume (CSV files)
-│       ├── samp/                   # SAMP yearly files
-│       └── inadimplencia/          # Default data
-├── bronze/                         # Schema
-│   ├── samp                        # Delta table
-│   ├── inadimplencia               # Delta table
-│   └── dominio_indicadores         # Delta table (dimension)
-├── silver/                         # Schema (in progress)
-└── gold/                           # Schema (planned)
+energy_project/                      # Catalog
+├── raw/                              # Schema
+│   └── aneel_files/                  # Volume (CSV files)
+│       ├── samp/                     # 7 yearly CSV files (2020–2026)
+│       └── inadimplencia/            # inadimplencia.csv + dominio-indicadores.csv
+├── bronze/                           # Schema
+│   ├── samp                          # Delta table — 6,808,591 rows, partitioned by year
+│   ├── inadimplencia                 # Delta table — ~1.1M rows
+│   └── dominio_indicadores           # Delta table — ~100 rows (dimension)
+├── silver/                           # Schema
+│   ├── samp                          # Delta table — 6,319,615 rows, partitioned by year
+│   ├── inadimplencia                 # Delta table — 1,104,153 rows, partitioned by year
+│   └── samp_quarantine               # Delta table — rows failing quality rules
+├── gold/                             # Schema (planned)
+└── information_schema/               # System schema
 ```
 
 ---
@@ -60,14 +64,12 @@ energy_project/                    # Catalog
 | Feature | Parquet | Delta Lake |
 |---|---|---|
 | Columnar storage | ✅ | ✅ (uses Parquet underneath) |
-| Compression | ✅ | ✅ |
+| Compression | ✅ | ✅ (~80% vs raw CSV) |
 | ACID transactions | ❌ | ✅ |
 | Time travel | ❌ | ✅ |
 | Schema evolution | ❌ | ✅ |
 | MERGE/UPDATE/DELETE | ❌ | ✅ |
 | Concurrent writes | ❌ | ✅ |
-
-**Trade-off:** Delta has slight overhead from the transaction log, but the operational benefits (rollback, reproducibility, concurrent access) far outweigh the cost.
 
 ---
 
@@ -76,28 +78,21 @@ energy_project/                    # Catalog
 **Decision:** Define `StructType` schemas explicitly for all readers.
 
 **Rationale:**
-During development, we observed that `inferSchema=true` produces **non-deterministic results** — the same dataset returned different row counts (14M vs 6.8M) across executions due to inconsistent type inference across cluster restarts.
+During development, `inferSchema=true` produced **non-deterministic results** — the same dataset returned different row counts (14M vs 6.8M) across executions due to inconsistent type inference across cluster restarts.
 
-**Root cause:** Spark samples data to infer types. When sampling differs between runs, type inference changes, and rows that don't match the inferred types may be silently dropped.
-
-**Resolution:** Use explicit `StringType` schema in Bronze. Type casting is deferred to Silver, where errors can be handled explicitly (NULL on failure, log to dead-letter queue, etc.).
-
-This is documented in [Apache Spark's official guidance](https://spark.apache.org/docs/latest/sql-data-sources-csv.html) as best practice for production pipelines.
+**Resolution:** Use explicit `StringType` schema in Bronze. Type casting is deferred to Silver.
 
 See [bronze_layer.md](bronze_layer.md#explicit-schema) for the full investigation.
 
 ---
 
-### 4. PT-BR Column Names Preserved in Bronze
+### 4. PT-BR Column Names Preserved in Bronze, Translated in Silver
 
-**Decision:** Keep original ANEEL column names (Portuguese) in the Bronze layer. Translate to English (snake_case) in Silver.
+**Decision:** Keep original ANEEL column names (Portuguese) in Bronze. Translate to English (snake_case) in Silver.
 
 **Rationale:**
-- **Traceability:** A column named `VlrMercado` can be looked up directly in ANEEL's data dictionary. A column named `market_value` cannot.
-- **Lineage:** When debugging, the ability to map back to the source is critical.
-- **Separation of concerns:** Bronze preserves source; Silver standardizes.
-
-**Implementation:** A `COLUMN_DICTIONARY` is documented in the Bronze notebook for reference, but no translation is applied at this layer.
+- **Traceability:** `VlrMercado` maps directly to ANEEL's official dictionary. `market_value` does not.
+- **Separation of concerns:** Bronze preserves source; Silver standardizes for analytics.
 
 See [data_dictionary.md](data_dictionary.md) for the full mapping.
 
@@ -105,16 +100,19 @@ See [data_dictionary.md](data_dictionary.md) for the full mapping.
 
 ### 5. Partitioning by Year
 
-**Decision:** Partition Bronze and downstream tables by `_partition_year` extracted from `DatCompetencia`.
+**Decision:** Partition `samp` (Bronze and Silver) by year. Do not partition `inadimplencia` or `dominio_indicadores`.
 
 **Rationale:**
-- Query patterns will heavily filter by year (year-over-year comparisons, trend analysis)
-- Partition pruning provides ~7x speedup for year-filtered queries
-- 7 yearly partitions are well-balanced (not too few, not too many)
+- `samp` (~1.5 GB) benefits significantly from partition pruning for year-filtered queries
+- `inadimplencia` (~58 MB) and `dominio_indicadores` (~40 KB) are too small to benefit — partitioning adds overhead without gain
 
-**Trade-off:** Partition columns add a small storage overhead but reduce I/O significantly for typical queries.
-
-See [bronze_layer.md](bronze_layer.md#partitioning) for benchmarks.
+```
+bronze.samp/             silver.samp/
+├── _partition_year=2020  ├── reference_year=2020
+├── _partition_year=2021  ├── reference_year=2021
+├── ...                   ├── ...
+└── _partition_year=2026  └── reference_year=2026
+```
 
 ---
 
@@ -126,27 +124,71 @@ See [bronze_layer.md](bronze_layer.md#partitioning) for benchmarks.
 |---|---|---|
 | `_ingestion_timestamp` | timestamp | When the row was loaded |
 | `_source_file` | string | Origin file path |
-| `_ingestion_date` | date | Load date (for partitioning/filtering) |
+| `_ingestion_date` | date | Load date |
 
-**Rationale:**
-Enables critical operational capabilities:
-- **Debugging:** Trace any row back to its source file and load time
-- **Incremental processing:** Filter by `_ingestion_date` for delta loads
-- **Auditability:** Compliance and reproducibility requirements
-- **Drift detection:** Compare data distributions across ingestion batches
-
-This implements the **Data Lineage** pattern that's foundational to MLOps.
+These are carried through to Silver for full lineage.
 
 See [bronze_layer.md](bronze_layer.md#metadata) for details.
 
 ---
 
-### 7. Modern Unity Catalog Patterns
+### 7. Broadcast Join for dominio_indicadores
 
-**Decision:** Use `_metadata.file_path` instead of the deprecated `input_file_name()`.
+**Decision:** Use `F.broadcast()` when joining `inadimplencia` with `dominio_indicadores` in Silver.
 
 **Rationale:**
-Databricks deprecated `input_file_name()` in Unity Catalog environments. The modern `_metadata` syntax provides richer information (file size, modification time, etc.) and is the recommended pattern.
+`dominio_indicadores` is ~40 KB — tiny. Broadcasting it sends a full copy to every executor, avoiding a costly shuffle join. This is the recommended pattern in Spark for fact + small dimension joins.
+
+```python
+df_inadimp_enriched = (
+    df_inadimp_typed
+    .join(F.broadcast(df_dominio), on="indicator_code", how="left")
+)
+```
+
+---
+
+### 8. Single `.count()` Per Table
+
+**Decision:** Avoid `.count()` mid-pipeline. Consolidate all row count checks into a single validation cell at the end of each notebook section.
+
+**Rationale (from Prof. Helder's lecture):**
+> *"Count is an extremely expensive operation because it is an action — Spark has to traverse the entire dataset. Working with big data is juggling to deal with these problems."*
+
+All quality checks (null counts, range validation, sample rows) are batched into a single validation step that triggers the DAG once, at the end.
+
+---
+
+### 9. reference_date Constructed from Year + Month
+
+**Decision:** Build `reference_date` from `AnoIndice` + `NumPeriodoIndice` in the inadimplência Silver transformation.
+
+**Rationale:**
+The inadimplência source has no single date column. Reference period is encoded as separate year and month integers. We construct the first day of each month as a proper `DateType`:
+
+```python
+.withColumn("reference_date",
+    F.to_date(
+        F.concat_ws("-",
+            F.col("AnoIndice"),
+            F.lpad(F.col("NumPeriodoIndice"), 2, "0"),
+            F.lit("01")
+        ),
+        "yyyy-MM-dd"
+    )
+)
+```
+
+---
+
+### 10. Quarantine Table for Bad Data
+
+**Decision:** Rows failing Silver quality rules are written to `silver.samp_quarantine` instead of being silently dropped.
+
+**Rationale:**
+Silent data loss is dangerous in production pipelines — it creates invisible discrepancies between source and destination. Quarantine tables make data quality issues visible and auditable.
+
+In this project's run: **0 rows quarantined** — all SAMP data passed quality rules.
 
 ---
 
@@ -154,28 +196,16 @@ Databricks deprecated `input_file_name()` in Unity Catalog environments. The mod
 
 ### Unity Catalog Tags
 
-Tags are applied at multiple levels for data classification and governance:
-
-**Catalog (`energy_project`):**
-- `project: energy_fraud_detection`
-- `team: data_engineering`
-- `environment: dev`
-
-**Schemas:**
-- `bronze` → `data_layer: bronze`, `data_quality: ingested`
-- `silver` → `data_layer: silver`, `data_quality: cleansed`
-- `gold` → `data_layer: gold`, `data_quality: production_ready`
+Tags applied at multiple levels:
 
 **Volume (`aneel_files`):**
 - `data_source: aneel`
 - `data_classification: public`
 - `pii: false`
+- `environment: dev`
+- `owner: zara_louise`
 
-These tags enable:
-- **Filtering** in Catalog Explorer
-- **Access policies** by tag
-- **Cost attribution** by project/team
-- **Compliance reporting**
+These tags enable filtering in Catalog Explorer, access policies by tag, and cost attribution by project.
 
 ---
 
@@ -210,10 +240,9 @@ These tags enable:
    - Workspace → Import → Select `notebooks/` folder
 
 5. **Run the pipeline in order:**
-   - `01_bronze_ingestion`
-   - `02_silver_transformation` (when available)
-   - `03_gold_features` (when available)
-   - `04_anomaly_model` (when available)
+   ```
+   01_bronze_ingestion → 02_silver_transformation → 03_gold_features (planned)
+   ```
 
 ---
 
