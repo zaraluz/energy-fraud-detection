@@ -16,6 +16,7 @@ The project follows Databricks' **medallion architecture** pattern, organizing d
 | **🥉 Bronze** | Lossless ingestion + metadata | Type-preserved (strings) | Source-faithful (PT-BR) | Data Engineers |
 | **🥈 Silver** | Cleansed, typed, validated, joined | Quality-enforced | Standardized (EN) | Data Scientists |
 | **🥇 Gold** | Aggregated, ML-ready | Business-validated | Use-case oriented | Analysts, BI users |
+| **🤖 ML** | Anomaly scoring | Model output | Score + label per distributor | Business users |
 
 ### Catalog Structure (Unity Catalog)
 
@@ -33,8 +34,43 @@ energy_project/                      # Catalog
 │   ├── samp                          # Delta table — 6,319,615 rows, partitioned by year
 │   ├── inadimplencia                 # Delta table — 1,104,153 rows, partitioned by year
 │   └── samp_quarantine               # Delta table — rows failing quality rules
-├── gold/                             # Schema (planned)
+├── gold/                             # Schema
+│   ├── features_distributor          # Delta table — 105 rows, 12 ML features
+│   └── risk_scores                   # Delta table — 105 rows, anomaly scores + ranking
 └── information_schema/               # System schema
+```
+
+### End-to-End Pipeline
+
+```
+Raw CSVs (Volume)
+    │
+    ▼
+01_bronze_ingestion
+    │  explicit StringType schema, audit metadata, partitioned by year
+    ▼
+Bronze Delta Tables
+    │
+    ▼
+02_silver_transformation
+    │  type casting, PT-BR→EN rename, dedup, quality rules, broadcast join
+    ▼
+Silver Delta Tables
+    │
+    ▼
+03_gold_features
+    │  aggregation per distributor, 12 features, Pandas bridge
+    ▼
+gold.features_distributor
+    │
+    ▼
+04_anomaly_model
+    │  Bartlett test → StandardScaler → PCA → Isolation Forest → MLflow
+    ▼
+gold.risk_scores + MLflow Model Registry
+    │
+    ▼
+Power BI Dashboard (planned)
 ```
 
 ---
@@ -51,15 +87,11 @@ energy_project/                      # Catalog
 - MLflow integration native
 - Production-grade environment with no cost
 
-**Trade-off:** Some advanced features (e.g., custom cluster libraries) are not available, but they're not needed for this project's scope.
-
 ---
 
 ### 2. Delta Lake over Apache Parquet
 
 **Decision:** Use Delta Lake format for all persisted tables.
-
-**Rationale:**
 
 | Feature | Parquet | Delta Lake |
 |---|---|---|
@@ -78,7 +110,7 @@ energy_project/                      # Catalog
 **Decision:** Define `StructType` schemas explicitly for all readers.
 
 **Rationale:**
-During development, `inferSchema=true` produced **non-deterministic results** — the same dataset returned different row counts (14M vs 6.8M) across executions due to inconsistent type inference across cluster restarts.
+During development, `inferSchema=true` produced **non-deterministic results** — the same dataset returned different row counts (14M vs 6.8M) across executions due to inconsistent type inference.
 
 **Resolution:** Use explicit `StringType` schema in Bronze. Type casting is deferred to Silver.
 
@@ -91,28 +123,23 @@ See [bronze_layer.md](bronze_layer.md#explicit-schema) for the full investigatio
 **Decision:** Keep original ANEEL column names (Portuguese) in Bronze. Translate to English (snake_case) in Silver.
 
 **Rationale:**
-- **Traceability:** `VlrMercado` maps directly to ANEEL's official dictionary. `market_value` does not.
-- **Separation of concerns:** Bronze preserves source; Silver standardizes for analytics.
+- **Traceability:** `VlrMercado` maps directly to ANEEL's official dictionary
+- **Separation of concerns:** Bronze preserves source; Silver standardizes
 
 See [data_dictionary.md](data_dictionary.md) for the full mapping.
 
 ---
 
-### 5. Partitioning by Year
+### 5. Partitioning by Year (Selective)
 
-**Decision:** Partition `samp` (Bronze and Silver) by year. Do not partition `inadimplencia` or `dominio_indicadores`.
+**Decision:** Partition large tables by year. Do not partition small tables.
 
-**Rationale:**
-- `samp` (~1.5 GB) benefits significantly from partition pruning for year-filtered queries
-- `inadimplencia` (~58 MB) and `dominio_indicadores` (~40 KB) are too small to benefit — partitioning adds overhead without gain
-
-```
-bronze.samp/             silver.samp/
-├── _partition_year=2020  ├── reference_year=2020
-├── _partition_year=2021  ├── reference_year=2021
-├── ...                   ├── ...
-└── _partition_year=2026  └── reference_year=2026
-```
+| Table | Size | Decision |
+|---|---|---|
+| `bronze.samp` / `silver.samp` | ~1.5 GB, 6.8M rows | Partitioned by year ✅ |
+| `bronze.inadimplencia` | ~58 MB | Not partitioned |
+| `gold.features_distributor` | 105 rows | Not partitioned |
+| `gold.risk_scores` | 105 rows | Not partitioned |
 
 ---
 
@@ -126,69 +153,94 @@ bronze.samp/             silver.samp/
 | `_source_file` | string | Origin file path |
 | `_ingestion_date` | date | Load date |
 
-These are carried through to Silver for full lineage.
-
-See [bronze_layer.md](bronze_layer.md#metadata) for details.
+These are carried through to Silver for full lineage. See [bronze_layer.md](bronze_layer.md#metadata) for details.
 
 ---
 
-### 7. Broadcast Join for dominio_indicadores
+### 7. Modern Unity Catalog Patterns
+
+**Decision:** Use `_metadata.file_path` instead of the deprecated `input_file_name()`.
+
+---
+
+### 8. Broadcast Join for dominio_indicadores
 
 **Decision:** Use `F.broadcast()` when joining `inadimplencia` with `dominio_indicadores` in Silver.
 
-**Rationale:**
-`dominio_indicadores` is ~40 KB — tiny. Broadcasting it sends a full copy to every executor, avoiding a costly shuffle join. This is the recommended pattern in Spark for fact + small dimension joins.
-
-```python
-df_inadimp_enriched = (
-    df_inadimp_typed
-    .join(F.broadcast(df_dominio), on="indicator_code", how="left")
-)
-```
+`dominio_indicadores` is ~40 KB. Broadcasting avoids a costly shuffle join.
 
 ---
 
-### 8. Single `.count()` Per Table
+### 9. Single `.count()` Per Table
 
-**Decision:** Avoid `.count()` mid-pipeline. Consolidate all row count checks into a single validation cell at the end of each notebook section.
+**Decision:** Avoid `.count()` mid-pipeline. Consolidate all checks into a single validation cell.
 
-**Rationale (from Prof. Helder's lecture):**
-> *"Count is an extremely expensive operation because it is an action — Spark has to traverse the entire dataset. Working with big data is juggling to deal with these problems."*
-
-All quality checks (null counts, range validation, sample rows) are batched into a single validation step that triggers the DAG once, at the end.
-
----
-
-### 9. reference_date Constructed from Year + Month
-
-**Decision:** Build `reference_date` from `AnoIndice` + `NumPeriodoIndice` in the inadimplência Silver transformation.
-
-**Rationale:**
-The inadimplência source has no single date column. Reference period is encoded as separate year and month integers. We construct the first day of each month as a proper `DateType`:
-
-```python
-.withColumn("reference_date",
-    F.to_date(
-        F.concat_ws("-",
-            F.col("AnoIndice"),
-            F.lpad(F.col("NumPeriodoIndice"), 2, "0"),
-            F.lit("01")
-        ),
-        "yyyy-MM-dd"
-    )
-)
-```
+> *"Count is an extremely expensive operation — Spark has to traverse the entire dataset."*
 
 ---
 
 ### 10. Quarantine Table for Bad Data
 
-**Decision:** Rows failing Silver quality rules are written to `silver.samp_quarantine` instead of being silently dropped.
-
-**Rationale:**
-Silent data loss is dangerous in production pipelines — it creates invisible discrepancies between source and destination. Quarantine tables make data quality issues visible and auditable.
+**Decision:** Rows failing Silver quality rules go to `silver.samp_quarantine` instead of being silently dropped.
 
 In this project's run: **0 rows quarantined** — all SAMP data passed quality rules.
+
+---
+
+### 11. Unsupervised ML — PCA + Isolation Forest
+
+**Decision:** Use StandardScaler → PCA → Isolation Forest for anomaly detection.
+
+**Rationale:**
+No labeled data exists. This rules out all supervised models.
+
+| Criteria | Justification |
+|---|---|
+| No labels available | Rules out supervised models (Logistic Regression, etc.) |
+| Fraud is rare by definition | Isolation Forest designed for imbalanced, rare-event detection |
+| Multiple correlated features | PCA removes multicollinearity before detection |
+| Interpretable output needed | 0–100 risk score is business-friendly |
+
+**Pipeline:**
+```
+StandardScaler → PCA (95% variance) → Isolation Forest (contamination=10%)
+     ↓                ↓                          ↓
+  Normalize      7 components            anomaly score per distributor
+  12 features    from 12 inputs          → normalized to 0–100
+```
+
+**Results:**
+- Bartlett's test: χ²=1456, p<0.000001 → PCA approved ✅
+- PCA: 12 features → 7 components, 95% variance explained
+- Anomalies: 11/105 distributors (10.5%)
+- Silhouette Score: 0.5206 (strong separation)
+- Top anomaly: ENEL CE (score 100.0)
+
+---
+
+### 12. MLflow for Experiment Tracking
+
+**Decision:** Log all model parameters, metrics, and artifacts to MLflow. Register in Databricks Model Registry.
+
+**Logged artifacts:**
+
+| Type | Content |
+|---|---|
+| Parameters | `contamination`, `pca_variance`, `n_components`, `n_estimators` |
+| Metrics | `pca_explained_variance`, `n_anomalies_detected`, `anomaly_rate`, `silhouette_score` |
+| Model | Full sklearn Pipeline (StandardScaler + PCA + IsolationForest) |
+
+---
+
+### 13. Pandas Bridge for sklearn
+
+**Decision:** Convert aggregated Spark DataFrame to Pandas before applying sklearn.
+
+scikit-learn runs on a single node — it cannot operate on Spark DataFrames. The bridge is safe because the Gold table has only 105 rows.
+
+```
+Spark (6.3M rows) → aggregate → Pandas (105 rows) → sklearn → Spark (write results)
+```
 
 ---
 
@@ -196,16 +248,12 @@ In this project's run: **0 rows quarantined** — all SAMP data passed quality r
 
 ### Unity Catalog Tags
 
-Tags applied at multiple levels:
-
-**Volume (`aneel_files`):**
+Tags applied on the Volume (`aneel_files`):
 - `data_source: aneel`
 - `data_classification: public`
 - `pii: false`
 - `environment: dev`
 - `owner: zara_louise`
-
-These tags enable filtering in Catalog Explorer, access policies by tag, and cost attribution by project.
 
 ---
 
@@ -226,22 +274,20 @@ These tags enable filtering in Catalog Explorer, access policies by tag, and cos
    CREATE SCHEMA IF NOT EXISTS energy_project.gold;
    ```
 
-2. **Create the Volume for raw files:**
+2. **Create the Volume:**
    ```sql
    CREATE VOLUME IF NOT EXISTS energy_project.raw.aneel_files;
    ```
 
-3. **Upload ANEEL data:**
-   - Catalog Explorer → `energy_project.raw.aneel_files`
+3. **Upload ANEEL data to the Volume:**
    - Create subdirectories: `samp/` and `inadimplencia/`
    - Upload CSV files to respective folders
 
-4. **Import notebooks:**
-   - Workspace → Import → Select `notebooks/` folder
+4. **Import notebooks to Databricks Workspace**
 
 5. **Run the pipeline in order:**
    ```
-   01_bronze_ingestion → 02_silver_transformation → 03_gold_features (planned)
+   01_bronze_ingestion → 02_silver_transformation → 03_gold_features → 04_anomaly_model
    ```
 
 ---
@@ -251,4 +297,5 @@ These tags enable filtering in Catalog Explorer, access policies by tag, and cos
 - [Databricks Medallion Architecture](https://www.databricks.com/glossary/medallion-architecture)
 - [Delta Lake Documentation](https://delta.io/learn/getting-started/)
 - [Unity Catalog Best Practices](https://docs.databricks.com/data-governance/unity-catalog/best-practices.html)
+- [Isolation Forest — scikit-learn](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.IsolationForest.html)
 - [ANEEL Resolution Nº 1003/2022](https://www2.aneel.gov.br/cedoc/ren20221003.pdf)

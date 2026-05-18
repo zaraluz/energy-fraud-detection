@@ -29,7 +29,7 @@ The Gold layer must:
 | `energy_project.gold.features_distributor` | `silver.samp` + `silver.inadimplencia` | 105 | 15 | No |
 | `energy_project.gold.risk_scores` | `gold.features_distributor` + ML model | 105 | 6 | No |
 
-> Both tables have ~105 rows (one per distributor) — too small to benefit from partitioning.
+> Both tables have ~105 rows — too small to benefit from partitioning.
 
 ---
 
@@ -54,21 +54,17 @@ The Gold layer must:
 
 ## 🔑 Key Engineering Decisions
 
-### 1. Filtering `market_detail` for Consumption
+### 1. Filtering market_detail for Consumption
 
 `market_value` in SAMP is polymorphic — the same column represents different things depending on `market_detail` (consumers, MWh, R$, taxes, etc.). We filter specifically for `"Energia Consumida (kWh)"` to get the actual billed consumption.
 
-```python
-df_samp.filter(F.col("market_detail") == "Energia Consumida (kWh)")
-```
-
-This was confirmed by inspecting all distinct `market_detail` values before writing any aggregation.
+This was confirmed by inspecting all 25+ distinct `market_detail` values before writing any aggregation.
 
 ---
 
 ### 2. Coefficient of Variation as Instability Signal
 
-Simple average consumption doesn't reveal anomalies — a distributor could have high average consumption legitimately. The coefficient of variation (cv = std/avg) captures **instability**:
+Simple average consumption doesn't reveal anomalies. The coefficient of variation (cv = std/avg) captures **instability**:
 
 ```python
 .withColumn("cv_consumption",
@@ -81,17 +77,13 @@ A high `cv_consumption` means consumption fluctuates wildly month to month — a
 
 ### 3. Trend Calculation via numpy.polyfit
 
-Time series slope is calculated using `numpy.polyfit(degree=1)` — the slope of the best-fit line through the monthly consumption series:
-
-```python
-np.polyfit(range(len(g)), g["total_kwh"], 1)[0]
-```
+Time series slope is calculated using `numpy.polyfit(degree=1)` — the slope of the best-fit line through the monthly series:
 
 - **Positive slope** → consumption growing (normal for expanding distributors)
 - **Negative slope** → consumption declining (potential fraud or customer loss)
 - **Extreme positive slope** → unusual growth (also worth investigating)
 
-A `safe_slope()` wrapper handles edge cases where polyfit fails (too few points or constant series):
+A `safe_slope()` wrapper handles edge cases where polyfit fails:
 
 ```python
 def safe_slope(g):
@@ -111,19 +103,19 @@ PySpark DataFrames cannot be used directly with scikit-learn. The bridge pattern
 Spark DataFrame (6.3M rows) → aggregate → Pandas DataFrame (105 rows) → sklearn
 ```
 
-`toPandas()` is safe here because the aggregated result is only 105 rows. The conversion happens **after** aggregation, not on raw data.
+`toPandas()` is safe here because the aggregated result is only 105 rows.
 
 ---
 
 ### 5. Null Filling Strategy
 
-Distributors present in SAMP but not in inadimplência (or vice versa) produce nulls after the join. These are filled with `0.0`:
+Distributors present in SAMP but not in inadimplência produce nulls after the join. These are filled with `0.0`:
 
 ```python
 .fillna(0.0)
 ```
 
-**Rationale:** a distributor with no reported default data has no known default risk — zero is the correct signal, not null. This also ensures the feature matrix is complete for all 105 distributors.
+A distributor with no reported default data has no known default risk — zero is the correct signal, not null.
 
 ---
 
@@ -136,11 +128,11 @@ A distributor with high default AND high consumption is less concerning than one
     F.col("avg_default_rate") / F.col("avg_consumption_kwh"))
 ```
 
-High ratio → default is large relative to consumption volume → stronger risk signal.
+High ratio → default is large relative to consumption → stronger risk signal.
 
 ---
 
-## 📊 Feature Statistics (Gold Output)
+## 📊 Feature Statistics
 
 | Feature | Min | Mean | Max | Notes |
 |---|---|---|---|---|
@@ -149,7 +141,7 @@ High ratio → default is large relative to consumption volume → stronger risk
 | `avg_default_rate` | 0.0 | 12,464 | 121,737 | Clear outlier at 121K |
 | `default_consumption_ratio` | 0.0 | 0.017 | 0.106 | Small but meaningful signal |
 
-The wide ranges across features confirm the need for `StandardScaler` before PCA.
+The wide ranges confirm the need for `StandardScaler` before PCA.
 
 ---
 
@@ -159,13 +151,13 @@ The wide ranges across features confirm the need for `StandardScaler` before PCA
 `market_value` in SAMP has 25+ distinct meanings. Aggregating without filtering would mix kWh with R$ and consumer counts — producing meaningless averages.
 
 ### 2. Coefficient of variation is more informative than raw standard deviation
-Raw stddev is correlated with mean (bigger distributors have bigger stddev). CV normalizes by mean, making it comparable across distributors of different sizes.
+Raw stddev is correlated with mean — bigger distributors have bigger stddev. CV normalizes by mean, making it comparable across distributors of different sizes.
 
 ### 3. The Pandas bridge is acceptable for small aggregated outputs
 Converting 6.3M rows to Pandas would crash the driver. Converting 105 rows is trivial. The key is aggregating first, converting second.
 
 ### 4. Null filling must be domain-driven
-Filling nulls with 0 here is correct because it means "no reported default." In other contexts, filling with mean or median might be more appropriate. Always justify null strategy with domain knowledge.
+Filling nulls with 0 here is correct because it means "no reported default." Always justify null strategy with domain knowledge.
 
 ---
 
