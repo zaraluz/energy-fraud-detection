@@ -1,8 +1,8 @@
 # ⚡ Energy Fraud & Default Risk Detection
 
-> End-to-end Big Data pipeline analyzing Brazil's electricity market to detect anomalous consumption patterns and predict default risk across 60+ power distributors.
+> End-to-end Big Data pipeline analyzing Brazil's electricity market to detect anomalous consumption patterns and predict default risk across 105 power distributors — from raw CSV ingestion to an interactive Power BI dashboard.
 
-![Status](https://img.shields.io/badge/status-ml_complete-brightgreen)
+![Status](https://img.shields.io/badge/status-complete-brightgreen)
 ![Databricks](https://img.shields.io/badge/Databricks-FF3621?logo=databricks&logoColor=white)
 ![Apache Spark](https://img.shields.io/badge/Apache_Spark-E25A1C?logo=apachespark&logoColor=white)
 ![Delta Lake](https://img.shields.io/badge/Delta_Lake-00ADD4?logo=delta&logoColor=white)
@@ -17,7 +17,7 @@
 
 This project implements a complete Big Data pipeline on **Databricks** using public data from **ANEEL** (Brazil's National Electric Energy Agency) to detect consumption anomalies and predict default risk across the Brazilian electricity distribution sector.
 
-The pipeline ingests **~1.5 GB** of raw monthly market data spanning 7 years (2020-2026), processes it through a **medallion architecture** (Bronze → Silver → Gold), trains an unsupervised anomaly detection model with MLflow tracking, and delivers insights through a Power BI dashboard.
+The pipeline ingests **~1.5 GB** of raw monthly market data spanning 7 years (2020–2026), processes it through a **medallion architecture** (Bronze → Silver → Gold), trains an unsupervised anomaly detection model with MLflow tracking, and delivers insights through a 3-page interactive Power BI dashboard.
 
 ### 💡 Business Problem
 
@@ -45,7 +45,7 @@ Both problems share a signal: **anomalous consumption patterns**. This project a
                           │                                        │
                           ▼                                        ▼
                     Unity Catalog                              Power BI
-                    Governance                              Dashboards
+                    Governance                             3-Page Dashboard
 ```
 
 See [docs/architecture.md](docs/architecture.md) for detailed architecture decisions.
@@ -56,12 +56,12 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture decis
 
 | Layer | Status | Records | Tables |
 |---|---|---|---|
-| 🟫 Raw | ✅ Complete | 9 CSV files (~1.6 GB) | - |
+| 🟫 Raw | ✅ Complete | 9 CSV files (~1.6 GB) | — |
 | 🥉 Bronze | ✅ Complete | 6,808,591 rows | `samp`, `inadimplencia`, `dominio_indicadores` |
 | 🥈 Silver | ✅ Complete | 7,423,768 rows | `samp`, `inadimplencia`, `samp_quarantine` |
 | 🥇 Gold | ✅ Complete | 105 distributors | `features_distributor`, `risk_scores` |
 | 🤖 ML Model | ✅ Complete | 11 anomalies detected | PCA + Isolation Forest (MLflow) |
-| 📈 Dashboard | 🔜 Planned | - | - |
+| 📈 Dashboard | ✅ Complete | 3 pages | Executive Overview · Anomaly Analysis · Distributor Profile |
 
 ---
 
@@ -91,6 +91,20 @@ The anomaly detection pipeline (StandardScaler → PCA → Isolation Forest) was
 
 ---
 
+## 📈 Dashboard
+
+The Power BI dashboard (`dashboard/energy-fraud.pbix`) delivers interactive insights across 3 pages:
+
+| Page | Description |
+|---|---|
+| **1 — Executive Overview** | KPI cards · Azure Maps bubble chart · HIGH RISK ranking table · Risk distribution donut |
+| **2 — Anomaly Analysis** | Consumption vs Default Rate scatter · Risk Score histogram · Consumer mix by distributor · Consumption trend by risk rank |
+| **3 — Distributor Profile** | Drill-through page with individual distributor KPIs · Consumer mix breakdown · Aging and variability indicators |
+
+See [dashboard/README.md](dashboard/README.md) for full documentation including DAX measures, data model, and setup instructions.
+
+---
+
 ## 🛠 Tech Stack
 
 | Layer | Technology |
@@ -101,7 +115,7 @@ The anomaly detection pipeline (StandardScaler → PCA → Isolation Forest) was
 | **ML Pipeline** | Scikit-learn (StandardScaler + PCA + Isolation Forest) |
 | **Experiment Tracking** | MLflow + Databricks Model Registry |
 | **Governance** | Unity Catalog with tags |
-| **Visualization** | Power BI (DirectQuery) |
+| **Visualization** | Power BI (DirectQuery via Databricks connector) |
 | **Version Control** | Git + GitHub |
 
 ---
@@ -110,27 +124,29 @@ The anomaly detection pipeline (StandardScaler → PCA → Isolation Forest) was
 
 ```
 energy-fraud-detection/
-├── README.md                    # This file
-├── LICENSE                       # MIT License
+├── README.md                        # This file
+├── LICENSE                          # MIT License
 ├── .gitignore
 │
-├── docs/                         # Detailed documentation
-│   ├── architecture.md           # Architecture decisions
-│   ├── bronze_layer.md           # Bronze layer deep dive
-│   ├── silver_layer.md           # Silver layer deep dive
-│   ├── gold_layer.md             # Gold layer deep dive
-│   └── data_dictionary.md        # PT-BR → EN column mapping
+├── docs/                            # Detailed documentation
+│   ├── architecture.md              # Architecture decisions
+│   ├── bronze_layer.md              # Bronze layer deep dive
+│   ├── silver_layer.md              # Silver layer deep dive
+│   ├── gold_layer.md                # Gold layer deep dive
+│   └── data_dictionary.md           # PT-BR → EN column mapping
 │
-├── notebooks/                    # Databricks notebooks
-│   ├── 01_bronze_ingestion.py    # ✅ Raw CSV → Bronze Delta
+├── notebooks/                       # Databricks notebooks
+│   ├── 01_bronze_ingestion.py       # ✅ Raw CSV → Bronze Delta
 │   ├── 02_silver_transformation.py  # ✅ Cleansing + joins
-│   ├── 03_gold_features.py       # ✅ Feature engineering
-│   └── 04_anomaly_model.py       # ✅ PCA + Isolation Forest + MLflow
+│   ├── 03_gold_features.py          # ✅ Feature engineering
+│   └── 04_anomaly_model.py          # ✅ PCA + Isolation Forest + MLflow
 │
-├── sql/                          # SQL queries and DDL
-├── dashboard/                    # Power BI files
-├── src/                          # Reusable Python modules
-└── tests/                        # Unit tests
+├── sql/                             # SQL queries and DDL
+├── dashboard/                       # Power BI files
+│   ├── README.md                    # ✅ Dashboard documentation
+│   └── energy-fraud.pbix            # Power BI report file
+├── src/                             # Reusable Python modules
+└── tests/                           # Unit tests
 ```
 
 ---
@@ -174,7 +190,11 @@ All data is **publicly available** through [ANEEL's open data portal](https://da
    01_bronze_ingestion → 02_silver_transformation → 03_gold_features → 04_anomaly_model
    ```
 
-See detailed setup instructions in [docs/architecture.md](docs/architecture.md#setup).
+4. **Open the dashboard**
+   - Open `dashboard/energy-fraud.pbix` in Power BI Desktop
+   - Update the Databricks connection string to your workspace
+
+See detailed setup instructions in [docs/architecture.md](docs/architecture.md#setup) and [dashboard/README.md](dashboard/README.md#setup).
 
 ---
 
@@ -208,7 +228,7 @@ This project applies industry best practices documented across [docs/](docs/):
 - [x] **v1.1** — Silver layer with type casting, validation and joins
 - [x] **v1.2** — Gold layer with engineered features
 - [x] **v2.0** — ML pipeline with MLflow tracking (PCA + Isolation Forest)
-- [ ] **v2.1** — Power BI dashboard
+- [x] **v2.1** — Power BI dashboard (3 pages · Azure Maps · drill-through)
 - [ ] **v3.0** — Geographic enrichment (IBGE data)
 - [ ] **v4.0** — Real-time scoring with Structured Streaming
 
@@ -221,6 +241,7 @@ This project applies industry best practices documented across [docs/](docs/):
 - [Silver Layer Deep Dive](docs/silver_layer.md)
 - [Gold Layer Deep Dive](docs/gold_layer.md)
 - [Data Dictionary (PT-BR → EN)](docs/data_dictionary.md)
+- [Dashboard Documentation](dashboard/README.md)
 
 ---
 
@@ -228,7 +249,7 @@ This project applies industry best practices documented across [docs/](docs/):
 
 **Zara Louise**
 
-Data Analyst | Big Data | MBA student in Big Data
+Data Analyst | Big Data | MBA in Data Science & AI — USP
 
 - 🔗 LinkedIn: [linkedin.com/in/zaralouise](https://linkedin.com/in/zaralouise)
 - 📧 Email: louise_zara@yahoo.com.br
