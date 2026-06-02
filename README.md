@@ -52,6 +52,24 @@ See [docs/architecture.md](docs/architecture.md) for detailed architecture decis
 
 ---
 
+## 📈 Dashboard Preview
+
+| Page 1 — Executive Overview |
+|---|
+| ![Executive Overview](dashboard/img/page1_executive.png) |
+
+| Page 2 — Anomaly Analysis |
+|---|
+| ![Anomaly Analysis](dashboard/img/page2_anomaly.png) |
+
+| Page 3 — Distributor Profile (drill-through) |
+|---|
+| ![Distributor Profile](dashboard/img/page3_profile.png) |
+
+See [dashboard/README.md](dashboard/README.md) for full documentation including DAX measures, data model, and setup.
+
+---
+
 ## 📊 Current Status
 
 | Layer | Status | Records | Tables |
@@ -97,11 +115,11 @@ The Power BI dashboard (`dashboard/energy-fraud.pbix`) delivers interactive insi
 
 | Page | Description |
 |---|---|
-| **1 — Executive Overview** | KPI cards · Azure Maps bubble chart · HIGH RISK ranking table · Risk distribution donut |
-| **2 — Anomaly Analysis** | Consumption vs Default Rate scatter · Risk Score histogram · Consumer mix by distributor · Consumption trend by risk rank |
-| **3 — Distributor Profile** | Drill-through page with individual distributor KPIs · Consumer mix breakdown · Aging and variability indicators |
+| **1 — Executive Overview** | KPI cards · Risk distribution donut · HIGH RISK ranking table · Azure Maps bubble chart · Risk by Region bar chart |
+| **2 — Anomaly Analysis** | Consumption vs Default Rate scatter · Risk Score distribution · Consumer mix by distributor · Consumption trend by risk rank |
+| **3 — Distributor Profile** | Drill-through page with individual distributor KPIs · Consumer mix breakdown · Aging and variability indicators · dynamic title in sidebar |
 
-See [dashboard/README.md](dashboard/README.md) for full documentation including DAX measures, data model, and setup instructions.
+See [dashboard/README.md](dashboard/README.md) for full documentation including DAX measures, data model, the `risk_scores_region` calculated table, and setup instructions.
 
 ---
 
@@ -144,7 +162,9 @@ energy-fraud-detection/
 ├── sql/                             # SQL queries and DDL
 ├── dashboard/                       # Power BI files
 │   ├── README.md                    # ✅ Dashboard documentation
-│   └── energy-fraud.pbix            # Power BI report file
+│   ├── energy-fraud.pbix            # Power BI report file
+│   └── img/                         # Dashboard page screenshots
+│
 ├── src/                             # Reusable Python modules
 └── tests/                           # Unit tests
 ```
@@ -217,6 +237,7 @@ This project applies industry best practices documented across [docs/](docs/):
 - 🌲 **Isolation Forest** — unsupervised anomaly detection, no labels required
 - ✅ **Bartlett's test** — prerequisite check confirming PCA appropriateness (p < 0.000001)
 - 📏 **Silhouette Score** — model quality metric for unsupervised learning (0.52)
+- 🗺️ **Region enrichment via calculated table** — `risk_scores_region` avoids ambiguous-path relationship conflicts in Power BI ([dashboard docs](dashboard/README.md#calculated-tables))
 
 ---
 
@@ -228,7 +249,7 @@ This project applies industry best practices documented across [docs/](docs/):
 - [x] **v1.1** — Silver layer with type casting, validation and joins
 - [x] **v1.2** — Gold layer with engineered features
 - [x] **v2.0** — ML pipeline with MLflow tracking (PCA + Isolation Forest)
-- [x] **v2.1** — Power BI dashboard (3 pages · Azure Maps · drill-through)
+- [x] **v2.1** — Power BI dashboard (3 pages · Azure Maps · drill-through · Risk by Region)
 - [ ] **v3.0** — Geographic enrichment (IBGE data)
 - [ ] **v4.0** — Real-time scoring with Structured Streaming
 
